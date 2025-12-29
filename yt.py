@@ -27,7 +27,7 @@ def download_short():
             'noplaylist': True,
         }
 
-        # IMPORTANT: download=False ensures Railway just returns URL
+        # Only extract URL, no download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             video_url = info.get('url')
