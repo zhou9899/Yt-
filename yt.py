@@ -9,6 +9,8 @@ app = Flask(__name__)
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+BASE_URL = "https://web-production-73a3d.up.railway.app"
+
 def convert_shorts_url(url: str) -> str:
     match = re.match(r'(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)', url)
     if match:
@@ -31,17 +33,17 @@ def download_short():
         ydl_opts = {
             'format': 'best[height<=720]',
             'noplaylist': True,
-            'outtmpl': filename,   # Save directly to MP4
+            'outtmpl': filename,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)  # <-- Full download
+            info = ydl.extract_info(url, download=True)
 
         return jsonify({
             'message': 'Short downloaded successfully',
             'title': info.get('title'),
             'thumbnail': info.get('thumbnail'),
-            'download_url': f"/downloads/{os.path.basename(filename)}"
+            'download_url': f"{BASE_URL}/downloads/{os.path.basename(filename)}"
         })
 
     except Exception as e:
