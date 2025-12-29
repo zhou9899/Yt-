@@ -1,1 +1,2 @@
-web: gunicorn yt:app
+pip install -r requirements.txt
+gunicorn yt:app
