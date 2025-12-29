@@ -27,8 +27,9 @@ def download_short():
             'noplaylist': True,
         }
 
+        # IMPORTANT: download=False ensures Railway just returns URL
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)  # Only get info, no download
+            info = ydl.extract_info(url, download=False)
             video_url = info.get('url')
 
         return jsonify({
@@ -38,10 +39,8 @@ def download_short():
             'video_url': video_url
         })
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({'error': f'Failed to extract video: {str(e)}'}), 500
     except Exception as e:
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
