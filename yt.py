@@ -3,6 +3,7 @@ import yt_dlp
 import re
 import os
 import uuid
+from threading import Thread
 
 app = Flask(__name__)
 
@@ -18,6 +19,17 @@ def convert_shorts_url(url: str) -> str:
         return f"https://www.youtube.com/watch?v={video_id}"
     return url
 
+def download_video(url, filename):
+    ydl_opts = {
+        'format': 'best[height<=720]',
+        'noplaylist': True,
+        'outtmpl': filename,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
 @app.route('/download', methods=['POST'])
 def download_short():
     data = request.json
@@ -26,28 +38,23 @@ def download_short():
         return jsonify({'error': 'URL required'}), 400
 
     url = convert_shorts_url(url)
+    temp_filename = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4()}.mp4")
 
-    try:
-        filename = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4()}.mp4")
+    # Extract info without downloading first
+    ydl_opts_info = {'format': 'best[height<=720]', 'noplaylist': True, 'quiet': True}
+    with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-        ydl_opts = {
-            'format': 'best[height<=720]',
-            'noplaylist': True,
-            'outtmpl': filename,
-        }
+    # Start background download
+    Thread(target=download_video, args=(url, temp_filename), daemon=True).start()
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-        return jsonify({
-            'message': 'Short downloaded successfully',
-            'title': info.get('title'),
-            'thumbnail': info.get('thumbnail'),
-            'download_url': f"{BASE_URL}/downloads/{os.path.basename(filename)}"
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # Return thumbnail and info immediately
+    return jsonify({
+        'message': f"Downloading '{info.get('title')}'...",
+        'title': info.get('title'),
+        'thumbnail': info.get('thumbnail'),
+        'download_url': f"{BASE_URL}/downloads/{os.path.basename(temp_filename)}"
+    })
 
 @app.route('/downloads/<filename>')
 def serve_download(filename):
