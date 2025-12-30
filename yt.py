@@ -10,11 +10,11 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 DOWNLOAD_DIR = './downloads'
-CLEANUP_INTERVAL = 3600  # Cleanup files older than 1 hour
+CLEANUP_INTERVAL = 3600  # 1 hour
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Convert shorts/short links to regular watch URLs
 def convert_shorts_url(url: str) -> str:
-    """Convert YouTube Shorts or youtu.be URL to regular watch URL"""
     patterns = [
         r'(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)',
         r'(https?://)?youtu\.be/([a-zA-Z0-9_-]+)'
@@ -26,40 +26,38 @@ def convert_shorts_url(url: str) -> str:
             return f"https://www.youtube.com/watch?v={video_id}"
     return url
 
+# Cleanup old files
 def cleanup_old_files():
-    """Remove files older than CLEANUP_INTERVAL"""
     while True:
         time.sleep(CLEANUP_INTERVAL)
         now = datetime.now()
-        for filename in os.listdir(DOWNLOAD_DIR):
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(filepath):
-                file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-                if now - file_time > timedelta(seconds=CLEANUP_INTERVAL):
-                    try:
-                        os.remove(filepath)
-                        print(f"Cleaned up: {filename}")
-                    except Exception as e:
-                        print(f"Error cleaning {filename}: {e}")
+        for f in os.listdir(DOWNLOAD_DIR):
+            path = os.path.join(DOWNLOAD_DIR, f)
+            if os.path.isfile(path) and now - datetime.fromtimestamp(os.path.getmtime(path)) > timedelta(seconds=CLEANUP_INTERVAL):
+                try:
+                    os.remove(path)
+                    print(f"Cleaned: {f}")
+                except:
+                    pass
 
-def download_video(url, filename):
-    """Download video in background thread with audio"""
+# Background download
+def download_media(url, filename, audio_only=False):
     try:
         ydl_opts = {
-            'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+            'format': 'bestaudio/best' if audio_only else 'best[height<=1080]/best',
             'outtmpl': filename,
             'quiet': True,
             'no_warnings': True,
-            'merge_output_format': 'mp4',
+            'postprocessors': [],
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0'
             }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        print(f"Download completed: {filename}")
+        print(f"Downloaded: {filename}")
     except Exception as e:
-        print(f"Download failed for {url}: {e}")
+        print(f"Failed {url}: {e}")
         try:
             if os.path.exists(filename):
                 os.remove(filename)
@@ -73,33 +71,28 @@ def download_short():
         return jsonify({'error': 'Invalid JSON'}), 400
 
     url = data.get('url')
+    audio_only = data.get('audio', False)  # New param: download audio only
     if not url:
         return jsonify({'error': 'URL required'}), 400
 
+    url = convert_shorts_url(url)
+
     try:
-        url = convert_shorts_url(url)
-
-        # Extract video info
-        ydl_opts_info = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+        # Extract info
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-
+        
         if not info:
-            return jsonify({'error': 'Could not extract video information'}), 400
+            return jsonify({'error': 'Could not extract info'}), 400
 
-        # Generate unique filename
         file_id = str(uuid.uuid4())
-        temp_filename = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
+        ext = 'mp3' if audio_only else 'mp4'
+        temp_filename = os.path.join(DOWNLOAD_DIR, f"{file_id}.{ext}")
 
         # Start background download
         thread = threading.Thread(
-            target=download_video,
-            args=(url, temp_filename),
+            target=download_media,
+            args=(url, temp_filename, audio_only),
             daemon=True
         )
         thread.start()
@@ -112,63 +105,43 @@ def download_short():
             'uploader': info.get('uploader', 'Unknown'),
             'thumbnail': info.get('thumbnail'),
             'download_id': file_id,
-            'filename': f"{file_id}.mp4"
+            'filename': f"{file_id}.{ext}"
         })
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({'error': 'Video not available or restricted', 'details': str(e)}), 400
     except Exception as e:
         return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
 
 @app.route('/downloads/<filename>')
 def serve_download(filename):
-    """Serve downloaded file"""
-    if not re.match(r'^[a-f0-9\-]{36}\.mp4$', filename):
+    # Security check
+    if not re.match(r'^[a-f0-9\-]{36}\.(mp4|mp3)$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
-
     filepath = os.path.join(DOWNLOAD_DIR, filename)
     if not os.path.exists(filepath):
         return jsonify({'error': 'File not found or expired'}), 404
-
-    return send_from_directory(
-        DOWNLOAD_DIR,
-        filename,
-        as_attachment=True,
-        download_name='video.mp4'
-    )
+    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 @app.route('/status/<file_id>')
 def check_status(file_id):
-    """Check if download is complete"""
-    filepath = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
-    if os.path.exists(filepath):
-        size = os.path.getsize(filepath)
-        return jsonify({
-            'status': 'ready',
-            'size': size,
-            'download_url': f"/downloads/{file_id}.mp4"
-        })
+    for ext in ['mp4', 'mp3']:
+        path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{ext}")
+        if os.path.exists(path):
+            return jsonify({'status': 'ready', 'download_url': f"/downloads/{file_id}.{ext}"})
     return jsonify({'status': 'processing'})
 
 @app.route('/cleanup', methods=['POST'])
 def manual_cleanup():
-    """Manually trigger cleanup"""
     deleted = 0
-    for filename in os.listdir(DOWNLOAD_DIR):
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        if os.path.isfile(filepath):
+    for f in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, f)
+        if os.path.isfile(path):
             try:
-                os.remove(filepath)
+                os.remove(path)
                 deleted += 1
             except:
                 pass
-    return jsonify({'message': f'Cleaned up {deleted} files'})
+    return jsonify({'message': f'Cleaned {deleted} files'})
 
 if __name__ == '__main__':
-    cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-    cleanup_thread.start()
-    app.run(
-        host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5000)),
-        debug=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    )
+    threading.Thread(target=cleanup_old_files, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
