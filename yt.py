@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
 import re
@@ -7,21 +6,19 @@ import uuid
 import threading
 import time
 from datetime import datetime, timedelta
-import shutil
 
 app = Flask(__name__)
 
 DOWNLOAD_DIR = './downloads'
-CLEANUP_INTERVAL = 3600  # Cleanup files older than 1 hour
+CLEANUP_INTERVAL = 3600
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def convert_shorts_url(url: str) -> str:
-    """Convert YouTube Shorts URL to regular watch URL"""
     patterns = [
         r'(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)',
         r'(https?://)?youtu\.be/([a-zA-Z0-9_-]+)'
     ]
-
+    
     for pattern in patterns:
         match = re.match(pattern, url)
         if match:
@@ -33,7 +30,6 @@ def convert_shorts_url(url: str) -> str:
     return url
 
 def cleanup_old_files():
-    """Remove files older than CLEANUP_INTERVAL"""
     while True:
         time.sleep(CLEANUP_INTERVAL)
         now = datetime.now()
@@ -49,14 +45,14 @@ def cleanup_old_files():
                         print(f"Error cleaning {filename}: {e}")
 
 def download_video(url, filename):
-    """Download video in background thread"""
+    """Download video in background thread - FIXED VERSION"""
     try:
+        # FIXED: Removed the problematic format string
         ydl_opts = {
-            'format': 'best[height<=720]/best[height<=480]/best',
+            'format': 'best[height<=720]',  # SIMPLE format - no complex groups
             'outtmpl': filename,
             'quiet': True,
             'no_warnings': True,
-            'postprocessors': [],
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
@@ -119,7 +115,7 @@ def download_short():
                 'title': info.get('title', 'Unknown Title'),
                 'duration': info.get('duration', 0),
                 'uploader': info.get('uploader', 'Unknown'),
-                'thumbnail': info.get('thumbnail'),
+                'thumbnail': info.get('thumbnail', ''),
                 'download_id': file_id,
                 'filename': f"{file_id}.mp4"
             })
@@ -127,12 +123,11 @@ def download_short():
     except yt_dlp.utils.DownloadError as e:
         return jsonify({'error': 'Video not available or restricted', 'details': str(e)}), 400
     except Exception as e:
+        print(f"Server error: {e}")  # Added logging
         return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
 
 @app.route('/downloads/<filename>')
 def serve_download(filename):
-    """Serve downloaded file"""
-    # Security check
     if not re.match(r'^[a-f0-9\-]{36}\.mp4$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
 
@@ -150,45 +145,30 @@ def serve_download(filename):
 
 @app.route('/status/<file_id>')
 def check_status(file_id):
-    """Check if download is complete"""
     filepath = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
 
     if os.path.exists(filepath):
         size = os.path.getsize(filepath)
-        return jsonify({
-            'status': 'ready',
-            'size': size,
-            'download_url': f"/downloads/{file_id}.mp4"
-        })
-    else:
-        return jsonify({'status': 'processing'})
+        if size > 1024:  # File must be > 1KB
+            return jsonify({
+                'status': 'ready',
+                'size': size,
+                'download_url': f"/downloads/{file_id}.mp4"
+            })
+    
+    return jsonify({'status': 'processing'})
 
-@app.route('/cleanup', methods=['POST'])
-def manual_cleanup():
-    """Manually trigger cleanup"""
-    try:
-        deleted = 0
-        for filename in os.listdir(DOWNLOAD_DIR):
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(filepath):
-                try:
-                    os.remove(filepath)
-                    deleted += 1
-                except:
-                    pass
-        return jsonify({'message': f'Cleaned up {deleted} files'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'healthy', 'success': True})
 
 if __name__ == '__main__':
-    # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
     cleanup_thread.start()
 
-    # Run Flask app
     app.run(
         host='0.0.0.0',
         port=int(os.environ.get('PORT', 5000)),
-        debug=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+        debug=False,
+        threaded=True
     )
-
