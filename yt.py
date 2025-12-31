@@ -4,356 +4,204 @@ import re
 import os
 import uuid
 import time
-import logging
+import json
 from threading import Thread
-from urllib.parse import urlparse
+import subprocess
+from pathlib import Path
 
 app = Flask(__name__)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 DOWNLOAD_DIR = './downloads'
+COMPRESSED_DIR = './compressed'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(COMPRESSED_DIR, exist_ok=True)
 
-# Get BASE_URL from environment or use default
-BASE_URL = os.environ.get('BASE_URL', 'https://web-production-73a3d.up.railway.app')
-if not BASE_URL.startswith(('http://', 'https://')):
-    BASE_URL = f'https://{BASE_URL}'
-
-logger.info(f"Using BASE_URL: {BASE_URL}")
+BASE_URL = "https://web-production-73a3d.up.railway.app"
 
 # Cleanup settings
 CLEANUP_INTERVAL = 60 * 60  # Run cleanup every hour
 FILE_LIFETIME = 60 * 60     # Delete files older than 1 hour
+MAX_SIZE_MB = 45  # Keep under 50MB with some buffer
 
-# WhatsApp limits
-WHATSAPP_MAX_SIZE = 50 * 1024 * 1024  # 50MB
-
+# Convert Shorts URLs to normal watch URLs
 def convert_shorts_url(url: str) -> str:
-    """Convert various YouTube URL formats to standard watch URL"""
-    if not url:
-        return url
-    
-    patterns = [
-        r'(https?://)?(www\.|m\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
-        r'(https?://)?youtu\.be/([a-zA-Z0-9_-]{11})',
-        r'(https?://)?(www\.|m\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
-        r'(https?://)?(www\.|m\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})'
-    ]
-    
-    for pattern in patterns:
-        match = re.match(pattern, url, re.IGNORECASE)
-        if match:
-            # Extract video ID based on pattern
-            if 'shorts' in pattern:
-                video_id = match.group(3)
-            elif 'youtu.be' in pattern:
-                video_id = match.group(2)
-            elif 'embed' in pattern:
-                video_id = match.group(3)
-            else:
-                video_id = match.group(3)
-            return f"https://www.youtube.com/watch?v={video_id}"
-    
+    match = re.match(r'(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)', url)
+    if match:
+        video_id = match.group(3)
+        return f"https://www.youtube.com/watch?v={video_id}"
     return url
 
-def validate_youtube_url(url: str) -> bool:
-    """Validate if URL is a valid YouTube URL"""
-    try:
-        parsed = urlparse(url)
-        if not parsed.netloc:
-            return False
-        
-        # Check domain
-        domain = parsed.netloc.lower()
-        if not any(yt_domain in domain for yt_domain in ['youtube.com', 'youtu.be']):
-            return False
-        
-        # Check for video ID patterns
-        patterns = [
-            r'v=([a-zA-Z0-9_-]{11})',
-            r'shorts/([a-zA-Z0-9_-]{11})',
-            r'youtu\.be/([a-zA-Z0-9_-]{11})',
-            r'embed/([a-zA-Z0-9_-]{11})'
-        ]
-        
-        for pattern in patterns:
-            if re.search(pattern, url):
-                return True
-        
-        return False
-    except Exception:
-        return False
-
-def get_best_format_for_whatsapp():
-    """Get format string optimized for WhatsApp"""
-    # Try 720p first, then fallback to lower qualities
-    return 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
-
-def download_video(url, filename, max_retries=2):
-    """Download video with retry logic"""
-    ydl_opts = {
-        'format': get_best_format_for_whatsapp(),
-        'noplaylist': True,
-        'outtmpl': filename,
-        'quiet': False,  # Set to True for production
-        'no_warnings': True,
-        'merge_output_format': 'mp4',
-        'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
-        'continuedl': True,
-        'consoletitle': False,
-        'progress_hooks': [lambda d: None],  # Disable progress hooks
-        'logger': logger,
-    }
-    
-    for attempt in range(max_retries):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            
-            # Verify download
-            if os.path.exists(filename) and os.path.getsize(filename) > 1024:  # At least 1KB
-                file_size = os.path.getsize(filename)
-                logger.info(f"Download successful: {filename}, Size: {file_size/1024/1024:.2f}MB")
-                return True
-            else:
-                logger.warning(f"Download created empty file, retrying...")
-                
-        except yt_dlp.utils.DownloadError as e:
-            logger.error(f"Download error (attempt {attempt + 1}): {str(e)}")
-            if "Private video" in str(e):
-                raise Exception("This video is private and cannot be downloaded")
-            elif "Members-only" in str(e):
-                raise Exception("This is a members-only video")
-            elif "Sign in" in str(e):
-                raise Exception("This video requires sign in")
-        except Exception as e:
-            logger.error(f"Unexpected error (attempt {attempt + 1}): {str(e)}")
-        
-        if attempt < max_retries - 1:
-            time.sleep(2)  # Wait before retry
-    
-    return False
-
 def get_video_info(url):
-    """Get video information"""
+    """Get video information without downloading"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False,
+        'skip_download': True,
+        'extract_flat': True,
     }
-    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+def compress_video(input_path, output_path, target_size_mb):
+    """Compress video to target size using ffmpeg"""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Sanitize title
-            title = info.get('title', 'Unknown Video')
-            title = re.sub(r'[<>:"/\\|?*]', '', title)  # Remove invalid filename chars
-            
-            return {
-                'title': title[:100],  # Limit title length
-                'thumbnail': info.get('thumbnail', ''),
-                'duration': info.get('duration', 0),
-                'uploader': info.get('uploader', 'Unknown')[:50],
-                'view_count': info.get('view_count', 0),
-                'description': (info.get('description', '')[:150] + '...') if info.get('description') else '',
-                'webpage_url': info.get('webpage_url', url),
-            }
+        # Get video duration
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+               '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
+        duration = float(subprocess.check_output(cmd).decode().strip())
+        
+        # Calculate target bitrate (in kbps)
+        target_bitrate = int((target_size_mb * 8192) / duration)  # Convert MB to kilobits
+        
+        # Limit bitrate for reasonable quality
+        target_bitrate = min(target_bitrate, 2500)  # Max 2500 kbps for good quality
+        
+        # Compress video
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',  # Good quality
+            '-maxrate', f'{target_bitrate}k',
+            '-bufsize', f'{target_bitrate*2}k',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',  # Overwrite output file
+            output_path
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
     except Exception as e:
-        logger.error(f"Error getting video info: {str(e)}")
-        raise
+        print(f"Compression failed: {e}")
+        return False
 
-def cleanup_files():
-    """Background cleanup of old files"""
-    while True:
-        try:
-            now = time.time()
-            deleted = 0
-            
-            for filename in os.listdir(DOWNLOAD_DIR):
-                if not filename.endswith('.mp4'):
-                    continue
-                    
-                filepath = os.path.join(DOWNLOAD_DIR, filename)
-                if os.path.isfile(filepath):
-                    file_age = now - os.path.getmtime(filepath)
-                    if file_age > FILE_LIFETIME:
-                        try:
-                            os.remove(filepath)
-                            deleted += 1
-                            logger.debug(f"Deleted old file: {filename}")
-                        except Exception as e:
-                            logger.error(f"Failed to delete {filename}: {e}")
-            
-            if deleted > 0:
-                logger.info(f"Cleanup deleted {deleted} files")
-                
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-        
-        time.sleep(CLEANUP_INTERVAL)
+def get_best_format(info, max_height=1080):
+    """Select best format within constraints"""
+    formats = info.get('formats', [])
+    
+    # Filter for video-only formats first
+    video_formats = [f for f in formats if f.get('vcodec') != 'none']
+    
+    # Sort by resolution, preferring mp4
+    video_formats.sort(key=lambda x: (
+        -int(x.get('height', 0) or 0) if x.get('height') else 0,
+        -int(x.get('width', 0) or 0) if x.get('width') else 0,
+        'mp4' in x.get('ext', '')
+    ))
+    
+    # Select best format under max_height
+    for fmt in video_formats:
+        height = fmt.get('height')
+        if height and height <= max_height:
+            return fmt['format_id']
+    
+    return 'best[height<=720]'
 
-# Start cleanup thread
-Thread(target=cleanup_files, daemon=True).start()
-
-@app.route('/')
-def index():
-    return jsonify({
-        'status': 'active',
-        'service': 'YouTube to WhatsApp Video Downloader',
-        'whatsapp_limit': '50MB',
-        'max_resolution': '720p',
-        'endpoints': {
-            'download': 'POST /download',
-            'serve': 'GET /downloads/<filename>'
-        }
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'healthy', 'timestamp': time.time()})
-
+# Download endpoint
 @app.route('/download', methods=['POST'])
-def download_video_endpoint():
-    """Download YouTube video"""
+def download_video():
+    data = request.json
+    url = data.get('url')
+    if not url:
+        return jsonify({'error': 'URL required'}), 400
+
+    url = convert_shorts_url(url)
+    unique_id = str(uuid.uuid4())
+    temp_filename = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp4")
+    compressed_filename = os.path.join(COMPRESSED_DIR, f"{unique_id}.mp4")
+
     try:
-        data = request.json or {}
-        url = data.get('url', '').strip()
-        
-        if not url:
-            return jsonify({'error': 'URL required'}), 400
-        
-        logger.info(f"Download request for URL: {url[:100]}...")
-        
-        # Validate URL
-        if not validate_youtube_url(url):
-            return jsonify({'error': 'Invalid YouTube URL. Please provide a valid YouTube video URL.'}), 400
-        
-        # Convert to standard format
-        original_url = url
-        url = convert_shorts_url(url)
-        logger.info(f"Converted URL: {url}")
-        
         # Get video info
-        try:
-            info = get_video_info(url)
-        except Exception as e:
-            logger.error(f"Failed to get video info: {str(e)}")
-            return jsonify({'error': f'Failed to get video information: {str(e)}'}), 400
+        info = get_video_info(url)
+        title = info.get('title', 'video')
         
-        # Check duration
-        if info['duration'] > 600:  # 10 minutes
-            logger.warning(f"Long video detected: {info['duration']} seconds")
-        
-        # Generate unique filename
-        file_id = str(uuid.uuid4())
-        filename = f"{file_id}.mp4"
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        # Select best format
+        format_id = get_best_format(info)
         
         # Download video
-        logger.info(f"Starting download: {info['title']}")
-        try:
-            success = download_video(url, filepath)
-            if not success:
-                return jsonify({'error': 'Failed to download video. Please try again.'}), 500
-        except Exception as e:
-            logger.error(f"Download failed: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-        
-        # Get file info
-        file_size = os.path.getsize(filepath)
-        file_size_mb = file_size / 1024 / 1024
-        whatsapp_compatible = file_size <= WHATSAPP_MAX_SIZE
-        
-        # Build response
-        response_data = {
-            'success': True,
-            'video': {
-                'title': info['title'],
-                'duration': info['duration'],
-                'uploader': info['uploader'],
-                'thumbnail': info['thumbnail'],
-                'original_url': original_url,
-            },
-            'download': {
-                'filename': filename,
-                'download_url': f"{BASE_URL}/downloads/{filename}",
-                'size_bytes': file_size,
-                'size_mb': round(file_size_mb, 2),
-                'whatsapp_compatible': whatsapp_compatible,
-                'expires_in_seconds': FILE_LIFETIME,
-            }
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': temp_filename,
+            'quiet': True,
+            'no_warnings': True,
+            'merge_output_format': 'mp4',
         }
         
-        if not whatsapp_compatible:
-            response_data['warning'] = 'Video exceeds WhatsApp 50MB limit. It may not send properly.'
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
         
-        logger.info(f"Download completed: {info['title']} ({file_size_mb:.2f}MB)")
-        return jsonify(response_data)
+        # Check file size
+        file_size_mb = os.path.getsize(temp_filename) / (1024 * 1024)
+        
+        if file_size_mb > MAX_SIZE_MB:
+            # Compress if too large
+            if compress_video(temp_filename, compressed_filename, MAX_SIZE_MB):
+                final_path = compressed_filename
+                compressed_size = os.path.getsize(compressed_filename) / (1024 * 1024)
+                message = f"Video compressed from {file_size_mb:.1f}MB to {compressed_size:.1f}MB"
+            else:
+                final_path = temp_filename
+                message = f"Video is {file_size_mb:.1f}MB (compression failed)"
+        else:
+            final_path = temp_filename
+            message = f"Video is {file_size_mb:.1f}MB"
+        
+        # Get thumbnail
+        thumbnail = info.get('thumbnail') or info.get('thumbnails', [{}])[0].get('url', '')
+        
+        # Get duration
+        duration = info.get('duration', 0)
+        
+        return jsonify({
+            'success': True,
+            'title': title,
+            'thumbnail': thumbnail,
+            'duration': duration,
+            'size_mb': round(os.path.getsize(final_path) / (1024 * 1024), 1),
+            'message': message,
+            'download_url': f"{BASE_URL}/downloads/{os.path.basename(final_path)}",
+            'original_size': round(file_size_mb, 1)
+        })
         
     except Exception as e:
-        logger.error(f"Unexpected error in download endpoint: {str(e)}", exc_info=True)
-        return jsonify({'error': 'Internal server error. Please try again later.'}), 500
+        # Cleanup on error
+        for path in [temp_filename, compressed_filename]:
+            if os.path.exists(path):
+                os.remove(path)
+        return jsonify({'error': str(e)}), 500
 
+# Serve downloads
 @app.route('/downloads/<filename>')
 def serve_download(filename):
-    """Serve downloaded files"""
-    try:
-        # Security: Only allow MP4 files with UUID names
-        if not re.match(r'^[a-f0-9\-]{36}\.mp4$', filename):
-            return jsonify({'error': 'Invalid filename'}), 400
-        
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        
-        # Check if file exists
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found or expired'}), 404
-        
-        # Check file age
-        file_age = time.time() - os.path.getmtime(filepath)
-        if file_age > FILE_LIFETIME:
-            try:
-                os.remove(filepath)
-            except:
-                pass
-            return jsonify({'error': 'File expired'}), 410
-        
-        # Get safe filename
-        safe_filename = f"video_{filename[:8]}.mp4"
-        
-        return send_from_directory(
-            DOWNLOAD_DIR,
-            filename,
-            as_attachment=True,
-            download_name=safe_filename,
-            mimetype='video/mp4'
-        )
-        
-    except Exception as e:
-        logger.error(f"Error serving file {filename}: {str(e)}")
-        return jsonify({'error': 'Failed to serve file'}), 500
+    # Check if in compressed or downloads directory
+    compressed_path = os.path.join(COMPRESSED_DIR, filename)
+    download_path = os.path.join(DOWNLOAD_DIR, filename)
+    
+    if os.path.exists(compressed_path):
+        return send_from_directory(COMPRESSED_DIR, filename, as_attachment=True)
+    elif os.path.exists(download_path):
+        return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+    else:
+        return jsonify({'error': 'File not found'}), 404
 
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Endpoint not found'}), 404
+# Cleanup function
+def cleanup_files():
+    while True:
+        now = time.time()
+        for directory in [DOWNLOAD_DIR, COMPRESSED_DIR]:
+            for f in os.listdir(directory):
+                filepath = os.path.join(directory, f)
+                if os.path.isfile(filepath) and now - os.path.getmtime(filepath) > FILE_LIFETIME:
+                    try:
+                        os.remove(filepath)
+                        print(f"Deleted old file: {filepath}")
+                    except Exception as e:
+                        print(f"Failed to delete {filepath}: {e}")
+        time.sleep(CLEANUP_INTERVAL)
 
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"500 error: {str(e)}")
-    return jsonify({'error': 'Internal server error'}), 500
+Thread(target=cleanup_files, daemon=True).start()
 
 if __name__ == '__main__':
-    # Get port from environment (for Railway/Heroku)
-    port = int(os.environ.get('PORT', 5000))
-    
-    logger.info(f"Starting server on port {port}")
-    logger.info(f"Download directory: {DOWNLOAD_DIR}")
-    logger.info(f"Base URL: {BASE_URL}")
-    
-    # For production, use waitress or gunicorn instead
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000)
