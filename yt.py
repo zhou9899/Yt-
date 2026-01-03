@@ -22,13 +22,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(COMPRESSED_DIR, exist_ok=True)
 
 # Use environment variable for base URL or default
-BASE_URL = os.environ.get('RAILWAY_STATIC_URL', 'https://web-production-73a3d.up.railway.app')
+BASE_URL = os.environ.get('RAILWAY_STATIC_URL', 'https://web-production-c7a2e.up.railway.app')
 
 # Cleanup settings
 CLEANUP_INTERVAL = 30 * 60  # Run cleanup every 30 minutes
 FILE_LIFETIME = 30 * 60     # Delete files older than 30 minutes (Railway has ephemeral storage)
-MAX_SIZE_MB = 45  # Keep under 50MB with buffer
-MAX_DURATION = 300  # Max 5 minutes to avoid huge files
+# REMOVED size limits - bot will handle compression
 
 # Convert Shorts URLs to normal watch URLs
 def convert_shorts_url(url: str) -> str:
@@ -38,7 +37,7 @@ def convert_shorts_url(url: str) -> str:
         r'(https?://)?(www\.)?youtu\.be/([a-zA-Z0-9_-]+)',
         r'(https?://)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)'
     ]
-    
+
     for pattern in patterns:
         match = re.match(pattern, url)
         if match:
@@ -72,199 +71,129 @@ def is_ffmpeg_available():
         logger.warning("ffmpeg not available, compression disabled")
         return False
 
-def compress_video_railway(input_path, output_path, target_size_mb):
-    """
-    Compress video for Railway environment
-    Uses simpler compression if ffmpeg is available
-    """
-    if not is_ffmpeg_available():
-        return False
-    
-    try:
-        # Get video duration
-        cmd = ['ffprobe', '-v', 'error', '-show_entries', 
-               'format=duration', '-of', 'json', input_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        duration = float(json.loads(result.stdout)['format']['duration'])
-        
-        # Skip if too long
-        if duration > MAX_DURATION:
-            logger.warning(f"Video too long ({duration}s), skipping compression")
-            return False
-        
-        # Calculate target bitrate (simplified for Railway)
-        target_bitrate = int((target_size_mb * 8000) / duration)  # Rough calculation
-        
-        # Limit bitrate ranges
-        if duration < 60:  # Short videos
-            target_bitrate = min(target_bitrate, 1500)
-        else:  # Longer videos
-            target_bitrate = min(target_bitrate, 1000)
-        
-        # Use simpler compression for Railway
-        cmd = [
-            'ffmpeg', '-i', input_path,
-            '-c:v', 'libx264',
-            '-preset', 'fast',  # Faster encoding
-            '-crf', '28',  # Slightly higher for smaller size
-            '-maxrate', f'{target_bitrate}k',
-            '-bufsize', f'{target_bitrate * 2}k',
-            '-c:a', 'aac',
-            '-b:a', '96k',  # Lower audio bitrate
-            '-movflags', '+faststart',
-            '-threads', '2',  # Limit threads for Railway
-            '-y',
-            output_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode == 0:
-            # Verify output file exists and is smaller
-            if os.path.exists(output_path):
-                original_size = os.path.getsize(input_path)
-                compressed_size = os.path.getsize(output_path)
-                
-                if compressed_size < original_size and compressed_size > 0:
-                    logger.info(f"Compressed from {original_size/1e6:.1f}MB to {compressed_size/1e6:.1f}MB")
-                    return True
-        
-        return False
-        
-    except subprocess.TimeoutExpired:
-        logger.error("Compression timed out")
-        return False
-    except Exception as e:
-        logger.error(f"Compression error: {e}")
-        return False
+# REMOVED compression functions - bot will handle if needed
 
-def select_optimal_format(info, max_height=720):
+def select_best_format(info):
     """
-    Select optimal format considering size and quality
-    Prioritizes smaller formats for WhatsApp
+    Select the BEST available quality (original resolution)
+    Returns format ID for highest quality progressive download
     """
     try:
         formats = info.get('formats', [])
         
         if not formats:
-            return 'best[height<=720]/best'
+            return 'best'  # Fallback to yt-dlp's best
         
-        # Filter for progressive downloads (single file)
+        # Find progressive formats (video+audio in one file)
         progressive_formats = [
-            f for f in formats 
-            if f.get('protocol') == 'https' 
+            f for f in formats
+            if f.get('protocol') == 'https'
             and f.get('vcodec') != 'none'
-            and f.get('acodec') != 'none'
-            and f.get('height', 0) <= max_height
+            and f.get('acodec') != 'none'  # Has both video and audio
+            and f.get('format_note', '').lower() not in ['dash', 'webm']  # Avoid DASH/WebM
         ]
         
         if progressive_formats:
-            # Sort by filesize if available, then by resolution
+            # Sort by: resolution (highest first), filesize (largest first for quality)
             progressive_formats.sort(key=lambda x: (
-                x.get('filesize', float('inf')),
-                -x.get('height', 0),
-                x.get('tbr', 0)
+                -x.get('height', 0),  # Highest resolution first
+                -x.get('width', 0),   # Then widest
+                -x.get('tbr', 0),     # Then highest bitrate
+                -x.get('filesize', 0) # Then largest file (usually better quality)
             ))
+            
+            logger.info(f"Selected format: {progressive_formats[0]['format_id']} "
+                       f"({progressive_formats[0].get('height', '?')}p, "
+                       f"{progressive_formats[0].get('ext', '?')})")
             return progressive_formats[0]['format_id']
         
-        # Fallback to standard format
-        return f'best[height<={max_height}]/best'
+        # If no progressive format found, use best combined format
+        return 'bestvideo+bestaudio/best'
         
     except Exception as e:
         logger.error(f"Error selecting format: {e}")
-        return 'best[height<=720]/best'
+        return 'best'  # Fallback to absolute best
 
 # Download endpoint
 @app.route('/download', methods=['POST'])
 def download_video():
-    """Main download endpoint with compression"""
+    """Main download endpoint - NO COMPRESSION, BEST QUALITY"""
     data = request.json
     url = data.get('url')
-    
+
     if not url:
         return jsonify({'error': 'URL required'}), 400
-    
+
     try:
         # Convert URL if needed
         url = convert_shorts_url(url)
         unique_id = str(uuid.uuid4())
-        temp_filename = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp4")
-        compressed_filename = os.path.join(COMPRESSED_DIR, f"{unique_id}.mp4")
-        
+        filename = f"{unique_id}.mp4"
+        output_path = os.path.join(DOWNLOAD_DIR, filename)
+
         # Get video info first
         logger.info(f"Fetching info for: {url}")
         info = get_video_info(url)
-        
+
         title = info.get('title', 'YouTube Video')
         duration = info.get('duration', 0)
         thumbnail = info.get('thumbnail', '')
         
-        # Check duration limit
-        if duration > MAX_DURATION:
-            return jsonify({
-                'error': f'Video too long ({duration}s). Max allowed: {MAX_DURATION}s',
-                'duration': duration,
-                'title': title
-            }), 400
-        
-        # Select optimal format
-        format_id = select_optimal_format(info)
-        logger.info(f"Selected format: {format_id}")
-        
-        # Download with yt-dlp
+        # Get resolution info
+        resolution = 'Unknown'
+        if info.get('height'):
+            resolution = f"{info.get('height')}p"
+        elif info.get('formats'):
+            # Find max resolution from formats
+            heights = [f.get('height', 0) for f in info.get('formats', []) if f.get('height')]
+            if heights:
+                resolution = f"{max(heights)}p"
+
+        # Select BEST format (no compression logic)
+        format_id = select_best_format(info)
+        logger.info(f"Selected BEST format: {format_id} for {resolution}")
+
+        # Download with yt-dlp - BEST QUALITY
         ydl_opts = {
             'format': format_id,
-            'outtmpl': temp_filename,
+            'outtmpl': output_path,
             'quiet': True,
             'no_warnings': True,
-            'merge_output_format': 'mp4',
+            'merge_output_format': 'mp4',  # Force MP4 output
             'no_check_certificate': True,
             'socket_timeout': 30,
             'retries': 3,
+            'continuedl': True,
+            'noprogress': True,
         }
-        
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
+
         # Check if download succeeded
-        if not os.path.exists(temp_filename):
+        if not os.path.exists(output_path):
             return jsonify({'error': 'Download failed'}), 500
-        
+
         # Get file size
-        original_size = os.path.getsize(temp_filename)
-        original_size_mb = original_size / (1024 * 1024)
-        
-        final_path = temp_filename
-        compressed = False
-        message = f"Video ready: {original_size_mb:.1f}MB"
-        
-        # Try compression if needed and available
-        if original_size_mb > MAX_SIZE_MB and is_ffmpeg_available():
-            logger.info(f"Attempting compression: {original_size_mb:.1f}MB > {MAX_SIZE_MB}MB")
-            
-            if compress_video_railway(temp_filename, compressed_filename, MAX_SIZE_MB):
-                compressed_size = os.path.getsize(compressed_filename) / (1024 * 1024)
-                
-                if compressed_size < original_size_mb:
-                    final_path = compressed_filename
-                    compressed = True
-                    message = f"Compressed: {original_size_mb:.1f}MB → {compressed_size:.1f}MB"
-        
-        # Prepare response
-        file_size_mb = os.path.getsize(final_path) / (1024 * 1024)
-        
+        file_size = os.path.getsize(output_path)
+        file_size_mb = file_size / (1024 * 1024)
+
+        # Prepare response with FULL quality info
         return jsonify({
             'success': True,
             'title': title,
             'thumbnail': thumbnail,
             'duration': duration,
+            'resolution': resolution,
+            'size_bytes': file_size,
             'size_mb': round(file_size_mb, 1),
-            'compressed': compressed,
-            'message': message,
-            'download_url': f"{BASE_URL}/downloads/{os.path.basename(final_path)}",
-            'id': unique_id
+            'quality': 'best',
+            'message': f"Video ready: {resolution}, {file_size_mb:.1f}MB",
+            'download_url': f"{BASE_URL}/downloads/{filename}",
+            'id': unique_id,
+            'format': format_id
         })
-        
+
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
         return jsonify({'error': 'Failed to download video. It might be private or restricted.'}), 400
@@ -287,27 +216,24 @@ def health_check():
 # Serve downloads
 @app.route('/downloads/<filename>')
 def serve_download(filename):
-    """Serve downloaded files"""
+    """Serve downloaded files - ORIGINAL QUALITY"""
     # Security check
     if '..' in filename or filename.startswith('/'):
         return jsonify({'error': 'Invalid filename'}), 400
+
+    filepath = os.path.join(DOWNLOAD_DIR, filename)
     
-    # Try compressed first, then downloads
-    paths_to_try = [
-        os.path.join(COMPRESSED_DIR, filename),
-        os.path.join(DOWNLOAD_DIR, filename)
-    ]
-    
-    for filepath in paths_to_try:
-        if os.path.exists(filepath):
-            # Set cache headers for Railway
-            response = send_from_directory(
-                os.path.dirname(filepath),
-                os.path.basename(filepath),
-                as_attachment=True
-            )
-            response.headers['Cache-Control'] = 'public, max-age=300'
-            return response
+    if os.path.exists(filepath):
+        # Set cache headers for Railway
+        response = send_from_directory(
+            DOWNLOAD_DIR,
+            filename,
+            as_attachment=True,
+            mimetype='video/mp4'
+        )
+        response.headers['Cache-Control'] = 'public, max-age=300'
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
     
     return jsonify({'error': 'File not found'}), 404
 
@@ -317,21 +243,20 @@ def cleanup_files():
     while True:
         try:
             now = time.time()
-            for directory in [DOWNLOAD_DIR, COMPRESSED_DIR]:
-                if os.path.exists(directory):
-                    for f in os.listdir(directory):
-                        filepath = os.path.join(directory, f)
-                        if os.path.isfile(filepath):
-                            file_age = now - os.path.getmtime(filepath)
-                            if file_age > FILE_LIFETIME:
-                                try:
-                                    os.remove(filepath)
-                                    logger.info(f"Cleaned up: {filepath}")
-                                except Exception as e:
-                                    logger.error(f"Failed to delete {filepath}: {e}")
+            if os.path.exists(DOWNLOAD_DIR):
+                for f in os.listdir(DOWNLOAD_DIR):
+                    filepath = os.path.join(DOWNLOAD_DIR, f)
+                    if os.path.isfile(filepath):
+                        file_age = now - os.path.getmtime(filepath)
+                        if file_age > FILE_LIFETIME:
+                            try:
+                                os.remove(filepath)
+                                logger.info(f"Cleaned up: {filepath}")
+                            except Exception as e:
+                                logger.error(f"Failed to delete {filepath}: {e}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
-        
+
         time.sleep(CLEANUP_INTERVAL)
 
 # Start cleanup thread
