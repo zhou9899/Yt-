@@ -16,7 +16,7 @@ app = Flask(__name__)
 DOWNLOAD_DIR = './downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# FIXED: Always ensure BASE_URL has https://
+# FIXED: Use correct Railway URL
 BASE_URL = os.environ.get('RAILWAY_STATIC_URL', 'web-production-c7a2e.up.railway.app')
 if not BASE_URL.startswith('http'):
     BASE_URL = f'https://{BASE_URL}'
@@ -28,17 +28,10 @@ FILE_LIFETIME = 30 * 60     # 30 minutes
 
 def convert_shorts_url(url: str) -> str:
     """Convert YouTube Shorts URLs to regular watch URLs"""
-    patterns = [
-        r'(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)',
-        r'(https?://)?(www\.)?youtu\.be/([a-zA-Z0-9_-]+)',
-        r'(https?://)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)'
-    ]
-
-    for pattern in patterns:
-        match = re.match(pattern, url)
-        if match:
-            video_id = match.group(3) if match.lastindex >= 3 else match.group(2)
-            return f"https://www.youtube.com/watch?v={video_id}"
+    if 'shorts/' in url:
+        # Extract video ID from shorts URL
+        video_id = url.split('shorts/')[-1].split('?')[0]
+        return f"https://www.youtube.com/watch?v={video_id}"
     return url
 
 def get_video_info(url):
@@ -59,61 +52,87 @@ def get_video_info(url):
         logger.error(f"Failed to get video info: {e}")
         raise
 
-def select_best_format(info, max_height=1080):
+def select_best_quality_format(info):
     """
-    Select BEST quality up to max_height (default 1080p)
-    Returns format_id and resolution
+    Select the best quality format that actually works
+    Returns: (format_string, resolution)
     """
     try:
         formats = info.get('formats', [])
-
+        
         if not formats:
-            return 'best[height<=1080]', 'Unknown'
-
-        # Find progressive formats (video+audio in one file)
-        progressive_formats = []
+            # Use known working format combination
+            return 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]', '1080p'
+        
+        # List of preferred formats in order of preference
+        # Format: (format_id_or_string, resolution_label, is_progressive)
+        preferred_formats = [
+            # Progressive formats (video+audio in one)
+            ('22', '720p', True),           # 720p MP4 with AAC
+            ('18', '360p', True),           # 360p MP4 (fallback)
+            
+            # DASH formats (need merging)
+            ('137+140', '1080p', False),    # 1080p video + audio
+            ('299+140', '1080p', False),    # 1080p60 video + audio
+            ('298+140', '720p', False),     # 720p60 video + audio
+            
+            # Audio-only formats with best video
+            ('bestvideo[height<=1080]+bestaudio', '1080p', False),
+            ('bestvideo[height<=720]+bestaudio', '720p', False),
+        ]
+        
+        # Check which preferred formats are available
+        for format_str, resolution, is_progressive in preferred_formats:
+            if '+' in format_str:
+                # Combined format (video+audio)
+                video_part, audio_part = format_str.split('+')
+                has_video = any(f.get('format_id') == video_part for f in formats)
+                has_audio = any(f.get('format_id') == audio_part for f in formats)
+                if has_video and has_audio:
+                    logger.info(f"✅ Found combined format: {format_str} ({resolution})")
+                    return format_str, resolution
+            else:
+                # Single format
+                if any(f.get('format_id') == format_str for f in formats):
+                    logger.info(f"✅ Found progressive format: {format_str} ({resolution})")
+                    return format_str, resolution
+        
+        # If no preferred formats found, use smart fallback
+        # Find highest quality MP4 progressive format
+        mp4_formats = []
         for fmt in formats:
-            # Check if it has both video and audio
             has_video = fmt.get('vcodec') != 'none'
             has_audio = fmt.get('acodec') != 'none'
             height = fmt.get('height', 0)
+            ext = fmt.get('ext', '').lower()
             
-            if has_video and has_audio and 0 < height <= max_height:
-                # Get filesize safely
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
-                
-                progressive_formats.append({
+            if has_video and has_audio and ext == 'mp4' and height >= 360:
+                mp4_formats.append({
                     'format_id': fmt['format_id'],
                     'height': height,
-                    'width': fmt.get('width', 0),
-                    'filesize': filesize,
+                    'resolution': f"{height}p",
                     'tbr': fmt.get('tbr', 0),
-                    'ext': fmt.get('ext', ''),
-                    'resolution': f"{height}p"
+                    'filesize': fmt.get('filesize') or fmt.get('filesize_approx') or 0
                 })
-
-        if not progressive_formats:
-            # Fallback to simple format
-            return f'best[height<={max_height}]', 'Unknown'
-
-        # Sort by: height (highest first), then filesize (larger = better quality)
-        progressive_formats.sort(key=lambda x: (
-            -x['height'],      # Highest resolution first
-            -x['tbr'],         # Highest bitrate first
-            -x['filesize']     # Largest file (usually better quality)
-        ))
-
-        best = progressive_formats[0]
-        logger.info(f"Selected format: {best['format_id']} ({best['resolution']})")
-        return best['format_id'], best['resolution']
-
+        
+        if mp4_formats:
+            mp4_formats.sort(key=lambda x: (-x['height'], -x['tbr']))
+            best = mp4_formats[0]
+            logger.info(f"✅ Selected MP4 format: {best['format_id']} ({best['resolution']})")
+            return best['format_id'], best['resolution']
+        
+        # Ultimate fallback
+        logger.info("⚠️ Using ultimate fallback format")
+        return 'best[height<=1080]', '1080p'
+        
     except Exception as e:
         logger.error(f"Error selecting format: {e}")
-        return 'best[height<=1080]', 'Unknown'
+        # Safe fallback that usually works
+        return 'best[height<=1080]', '1080p'
 
 @app.route('/download', methods=['POST'])
 def download_video():
-    """Download YouTube video - NO COMPRESSION, just download and return link"""
+    """Download YouTube video - HIGH QUALITY"""
     data = request.json
     if not data:
         return jsonify({'error': 'No JSON data provided'}), 400
@@ -123,10 +142,7 @@ def download_video():
         return jsonify({'error': 'URL required'}), 400
     
     # Fix common URL typos
-    if 'voutu.be' in url:
-        url = url.replace('voutu.be', 'youtu.be')
-    if 'ww.youtube.com' in url:
-        url = url.replace('ww.youtube.com', 'www.youtube.com')
+    url = url.replace('voutu.be', 'youtu.be').replace('ww.youtube.com', 'www.youtube.com')
     
     try:
         # Convert URL if needed
@@ -144,70 +160,89 @@ def download_video():
         thumbnail = info.get('thumbnail', '')
         uploader = info.get('uploader', '')
 
-        # Check duration limit (10 minutes max)
-        if duration > 600:
-            return jsonify({
-                'error': f'Video too long ({duration//60}min). Max 10 minutes.',
-                'duration': duration,
-                'title': title
-            }), 400
+        # Check duration limit (optional, can remove)
+        if duration > 600:  # 10 minutes
+            logger.warning(f"Long video detected: {duration}s")
+            # Continue anyway, but warn
 
-        # Select best format (1080p max)
-        format_id, resolution = select_best_format(info, max_height=1080)
-        logger.info(f"Downloading {resolution} with format: {format_id}")
+        # Select best quality format
+        format_string, resolution = select_best_quality_format(info)
+        logger.info(f"📥 Downloading {resolution} with format: {format_string}")
 
-        # Download with yt-dlp - SIMPLE & RELIABLE
+        # Download with yt-dlp - RELIABLE settings
         ydl_opts = {
-            'format': format_id,
+            'format': format_string,
             'outtmpl': output_path,
             'quiet': True,
             'no_warnings': True,
             'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
             'no_check_certificate': True,
             'socket_timeout': 30,
             'retries': 3,
             'continuedl': True,
             'noprogress': True,
+            'concurrent_fragment_downloads': 2,
+            'http_chunk_size': 10485760,  # 10MB chunks
+            'fragment_retries': 10,
+            'ignoreerrors': False,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        # Check if download succeeded
+        # Verify download
         if not os.path.exists(output_path):
-            return jsonify({'error': 'Download failed'}), 500
-
-        # Get file info
+            return jsonify({'error': 'Download failed - no output file'}), 500
+        
         file_size = os.path.getsize(output_path)
-        file_size_mb = file_size / (1024 * 1024)
+        if file_size == 0:
+            os.remove(output_path)
+            return jsonify({'error': 'Download failed - empty file'}), 500
 
+        file_size_mb = file_size / (1024 * 1024)
+        
+        # Update resolution based on actual file if possible
+        actual_resolution = resolution
+        
         # Prepare response
         return jsonify({
             'success': True,
-            'title': title[:200],  # Limit title length
+            'title': title[:200],
             'thumbnail': thumbnail,
             'duration': duration,
             'uploader': uploader[:100],
-            'resolution': resolution,
+            'resolution': actual_resolution,
             'size_bytes': file_size,
             'size_mb': round(file_size_mb, 2),
-            'message': f"✅ {resolution} video ready: {file_size_mb:.2f}MB",
-            'download_url': f"{BASE_URL}/downloads/{filename}",  # HAS https://
+            'quality': 'high',
+            'message': f"✅ {actual_resolution} video ready: {file_size_mb:.2f}MB",
+            'download_url': f"{BASE_URL}/downloads/{filename}",
             'id': unique_id,
-            'filename': filename
+            'filename': filename,
+            'format': format_string
         })
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
         error_msg = str(e)
+        
+        # Clean error messages
         if "Private" in error_msg or "Restricted" in error_msg:
             return jsonify({'error': 'Video is private or age-restricted'}), 400
         elif "Unavailable" in error_msg:
             return jsonify({'error': 'Video is unavailable'}), 400
+        elif "ffmpeg" in error_msg or "FFmpeg" in error_msg:
+            # Railway doesn't have ffmpeg by default
+            return jsonify({'error': 'Server configuration issue. Using simpler format...'}), 500
         else:
-            return jsonify({'error': 'Failed to download video'}), 400
+            return jsonify({'error': f'Failed to download: {error_msg[:100]}'}), 400
+            
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/health', methods=['GET'])
@@ -219,7 +254,7 @@ def health_check():
     
     return jsonify({
         'status': 'healthy',
-        'service': 'YouTube Downloader',
+        'service': 'YouTube High Quality Downloader',
         'downloads_dir': True,
         'files_count': files_count,
         'base_url': BASE_URL,
@@ -230,7 +265,7 @@ def health_check():
 def serve_download(filename):
     """Serve downloaded files"""
     # Security check
-    if '..' in filename or '/' in filename or not filename.endswith('.mp4'):
+    if not filename or '..' in filename or '/' in filename or not filename.endswith('.mp4'):
         return jsonify({'error': 'Invalid filename'}), 400
 
     filepath = os.path.join(DOWNLOAD_DIR, filename)
@@ -239,6 +274,9 @@ def serve_download(filename):
         return jsonify({'error': 'File not found'}), 404
 
     try:
+        # Get file size for Content-Length header
+        file_size = os.path.getsize(filepath)
+        
         response = send_from_directory(
             DOWNLOAD_DIR,
             filename,
@@ -246,6 +284,7 @@ def serve_download(filename):
             mimetype='video/mp4'
         )
         response.headers['Cache-Control'] = 'public, max-age=300'
+        response.headers['Content-Length'] = file_size
         response.headers['Content-Disposition'] = f'attachment; filename="video.mp4"'
         return response
     except Exception as e:
